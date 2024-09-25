@@ -287,6 +287,8 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
+        # print(q_len)
+        
         if self.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.pretraining_tp
             query_slices = self.q_proj.weight.split((self.num_heads * self.head_dim) // self.pretraining_tp, dim=0)
@@ -315,6 +317,8 @@ class LlamaAttention(nn.Module):
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         
+        o_query_states = query_states.clone().detach()
+        o_key_states = key_states.clone().detach()
         
         cos, sin = self.rotary_emb(value_states, seq_len=1000)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -331,6 +335,24 @@ class LlamaAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        if(q_len>1):
+            visual_token_masks = torch.zeros(q_len, dtype=torch.bool, device=query_states.device)
+            visual_token_masks[35:35+576] = 1
+            visual_token_masks = torch.tensor(visual_token_masks, dtype=torch.int)
+            visual_token_masks=visual_token_masks.unsqueeze(0)
+            visual_token_masks=visual_token_masks.unsqueeze(1)
+            visual_token_masks=visual_token_masks.unsqueeze(-1) 
+        
+            attn_weight_no_r =  torch.matmul(o_query_states, o_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+            f_visual_token_masks = 1-visual_token_masks
+            part1 = attn_weight_no_r * visual_token_masks
+            part1[torch.isnan(part1)] = 0
+            part2 = attn_weights * f_visual_token_masks
+            part2[torch.isnan(part2)] = 0
+            r_attention_2 = part1+part2
+            attn_weights = r_attention_2
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
